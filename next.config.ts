@@ -1,7 +1,13 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  serverExternalPackages: [
+    "pdf-parse",
+    "@langchain/community",
+    "@langchain/classic",
+    "@huggingface/inference",
+    "@qdrant/js-client-rest",
+  ],
 };
 
 export default nextConfig;
