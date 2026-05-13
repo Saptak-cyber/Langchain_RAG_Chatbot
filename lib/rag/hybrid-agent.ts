@@ -1,5 +1,6 @@
 import { Annotation, StateGraph, START, END } from "@langchain/langgraph";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
+import type { RunnableConfig } from "@langchain/core/runnables";
 import type { Document } from "@langchain/core/documents";
 import { HuggingFaceBgeEmbeddings } from "./hf-inference-embeddings";
 import { getRetriever } from "./vectorstore";
@@ -86,19 +87,39 @@ function routeAfterQuality(state: HybridState): "refine_query" | typeof END {
 // Node factories (closed over per-request state)
 // ---------------------------------------------------------------------------
 
+/** Shared metadata attached to every LLM span so LangSmith shows context. */
+function runMeta(
+  nodeName: string,
+  state: HybridState,
+): RunnableConfig {
+  return {
+    runName: `hybrid-rag:${nodeName}`,
+    tags: ["hybrid-rag", nodeName],
+    metadata: {
+      documentId: state.documentId,
+      originalQuery: state.originalQuery,
+      enhancedQuery: state.enhancedQuery || state.originalQuery,
+      retrievalAttempts: state.retrievalAttempts,
+    },
+  };
+}
+
 function makeNodes(documentId: string, capturedDocs: Document[]) {
   const embeddings = new HuggingFaceBgeEmbeddings();
 
   async function enhance_query(state: HybridState) {
     const llm = createLLM();
-    const response = await llm.invoke([
-      new SystemMessage(
-        "You are a query enhancement specialist. " +
-          "Rewrite the user's question to be more specific and retrieval-friendly for a document search. " +
-          "Return ONLY the rewritten query — no explanation, no preamble.",
-      ),
-      new HumanMessage(state.originalQuery),
-    ]);
+    const response = await llm.invoke(
+      [
+        new SystemMessage(
+          "You are a query enhancement specialist. " +
+            "Rewrite the user's question to be more specific and retrieval-friendly for a document search. " +
+            "Return ONLY the rewritten query — no explanation, no preamble.",
+        ),
+        new HumanMessage(state.originalQuery),
+      ],
+      runMeta("enhance_query", state),
+    );
     const enhanced =
       typeof response.content === "string"
         ? response.content.trim()
@@ -108,15 +129,18 @@ function makeNodes(documentId: string, capturedDocs: Document[]) {
 
   async function check_needs_retrieval(state: HybridState) {
     const llm = createLLM();
-    const response = await llm.invoke([
-      new SystemMessage(
-        "You decide whether a document search is required to answer a question. " +
-          "Reply with exactly YES or NO.\n" +
-          'Say NO only if the question is a greeting, simple arithmetic, or general knowledge that needs no document context.\n' +
-          "Say YES for everything else.",
-      ),
-      new HumanMessage(state.enhancedQuery),
-    ]);
+    const response = await llm.invoke(
+      [
+        new SystemMessage(
+          "You decide whether a document search is required to answer a question. " +
+            "Reply with exactly YES or NO.\n" +
+            "Say NO only if the question is a greeting, simple arithmetic, or general knowledge that needs no document context.\n" +
+            "Say YES for everything else.",
+        ),
+        new HumanMessage(state.enhancedQuery),
+      ],
+      runMeta("check_needs_retrieval", state),
+    );
     const text =
       typeof response.content === "string"
         ? response.content.trim().toUpperCase()
@@ -126,7 +150,16 @@ function makeNodes(documentId: string, capturedDocs: Document[]) {
 
   async function retrieve(state: HybridState) {
     const retriever = getRetriever(embeddings, documentId);
-    const docs = await retriever.invoke(state.enhancedQuery);
+    const docs = await retriever.invoke(state.enhancedQuery, {
+      runName: "hybrid-rag:retrieve",
+      tags: ["hybrid-rag", "retrieve"],
+      metadata: {
+        documentId: state.documentId,
+        originalQuery: state.originalQuery,
+        enhancedQuery: state.enhancedQuery,
+        retrievalAttempts: state.retrievalAttempts + 1,
+      },
+    });
     // Persist unique docs for the API route to use as sources
     for (const doc of docs) {
       if (!capturedDocs.some((d) => d.pageContent === doc.pageContent)) {
@@ -141,16 +174,19 @@ function makeNodes(documentId: string, capturedDocs: Document[]) {
     const context = state.retrievedDocs
       .map((d, i) => `[${i + 1}] ${d.pageContent}`)
       .join("\n\n");
-    const response = await llm.invoke([
-      new SystemMessage(
-        "You evaluate whether the retrieved document chunks contain enough information " +
-          "to fully answer the question. " +
-          "Reply with exactly YES or NO.",
-      ),
-      new HumanMessage(
-        `Question: ${state.enhancedQuery}\n\nRetrieved chunks:\n${context}`,
-      ),
-    ]);
+    const response = await llm.invoke(
+      [
+        new SystemMessage(
+          "You evaluate whether the retrieved document chunks contain enough information " +
+            "to fully answer the question. " +
+            "Reply with exactly YES or NO.",
+        ),
+        new HumanMessage(
+          `Question: ${state.enhancedQuery}\n\nRetrieved chunks:\n${context}`,
+        ),
+      ],
+      runMeta("check_sufficiency", state),
+    );
     const text =
       typeof response.content === "string"
         ? response.content.trim().toUpperCase()
@@ -164,19 +200,22 @@ function makeNodes(documentId: string, capturedDocs: Document[]) {
       .slice(0, 3)
       .map((d, i) => `[${i + 1}] ${d.pageContent.slice(0, 300)}`)
       .join("\n\n");
-    const response = await llm.invoke([
-      new SystemMessage(
-        "You are a query refinement specialist. " +
-          "Given the original question, the current search query, and snippets that were retrieved but insufficient, " +
-          "generate a more targeted search query. " +
-          "Return ONLY the refined query — nothing else.",
-      ),
-      new HumanMessage(
-        `Original question: ${state.originalQuery}\n` +
-          `Current search query: ${state.enhancedQuery}\n\n` +
-          `Insufficient snippets:\n${context}`,
-      ),
-    ]);
+    const response = await llm.invoke(
+      [
+        new SystemMessage(
+          "You are a query refinement specialist. " +
+            "Given the original question, the current search query, and snippets that were retrieved but insufficient, " +
+            "generate a more targeted search query. " +
+            "Return ONLY the refined query — nothing else.",
+        ),
+        new HumanMessage(
+          `Original question: ${state.originalQuery}\n` +
+            `Current search query: ${state.enhancedQuery}\n\n` +
+            `Insufficient snippets:\n${context}`,
+        ),
+      ],
+      runMeta("refine_query", state),
+    );
     const refined =
       typeof response.content === "string"
         ? response.content.trim()
@@ -198,14 +237,23 @@ function makeNodes(documentId: string, capturedDocs: Document[]) {
         "Be thorough, accurate, and cite the relevant sections by their number [1], [2], etc."
       : "You are a helpful assistant. Answer the user's question directly.";
 
-    const response = await llm.invoke([
-      new SystemMessage(sysPrompt),
-      new HumanMessage(
-        hasDocs
-          ? `Context:\n${context}\n\nQuestion: ${state.originalQuery}`
-          : state.originalQuery,
-      ),
-    ]);
+    const response = await llm.invoke(
+      [
+        new SystemMessage(sysPrompt),
+        new HumanMessage(
+          hasDocs
+            ? `Context:\n${context}\n\nQuestion: ${state.originalQuery}`
+            : state.originalQuery,
+        ),
+      ],
+      {
+        ...runMeta("generate_answer", state),
+        metadata: {
+          ...runMeta("generate_answer", state).metadata,
+          docsUsed: state.retrievedDocs.length,
+        },
+      },
+    );
     const answer =
       typeof response.content === "string"
         ? response.content
@@ -215,15 +263,18 @@ function makeNodes(documentId: string, capturedDocs: Document[]) {
 
   async function check_quality(state: HybridState) {
     const llm = createLLM();
-    const response = await llm.invoke([
-      new SystemMessage(
-        "You evaluate the quality of an answer to a question. " +
-          'Reply with exactly YES if the answer is complete and accurate, or NO if it is incomplete, evasive, or says "I don\'t have enough information".',
-      ),
-      new HumanMessage(
-        `Question: ${state.originalQuery}\n\nAnswer: ${state.answer}`,
-      ),
-    ]);
+    const response = await llm.invoke(
+      [
+        new SystemMessage(
+          "You evaluate the quality of an answer to a question. " +
+            'Reply with exactly YES if the answer is complete and accurate, or NO if it is incomplete, evasive, or says "I don\'t have enough information".',
+        ),
+        new HumanMessage(
+          `Question: ${state.originalQuery}\n\nAnswer: ${state.answer}`,
+        ),
+      ],
+      runMeta("check_quality", state),
+    );
     const text =
       typeof response.content === "string"
         ? response.content.trim().toUpperCase()
