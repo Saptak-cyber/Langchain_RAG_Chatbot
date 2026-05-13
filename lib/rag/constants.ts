@@ -9,3 +9,7 @@ export const CHUNK_SIZE = 1000;
 export const CHUNK_OVERLAP = 200;
 
 export const RETRIEVAL_K = 6;
+
+/** Hybrid RAG loop guards */
+export const MAX_RETRIEVAL_ATTEMPTS = 3;
+export const MAX_QUALITY_RETRIES = 1;

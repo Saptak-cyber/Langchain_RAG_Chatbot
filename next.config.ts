@@ -5,6 +5,7 @@ const nextConfig: NextConfig = {
     "pdf-parse",
     "@langchain/community",
     "@langchain/classic",
+    "@langchain/langgraph",
     "@huggingface/inference",
     "@qdrant/js-client-rest",
   ],

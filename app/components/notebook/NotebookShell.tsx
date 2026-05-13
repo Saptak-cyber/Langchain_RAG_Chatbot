@@ -22,6 +22,8 @@ export default function NotebookShell() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [thinking, setThinking] = useState(false);
+  const [thinkingStep, setThinkingStep] = useState("");
+  const [streamingContent, setStreamingContent] = useState("");
   const [sources, setSources] = useState<Source[]>([]);
   const [sourcesOpen, setSourcesOpen] = useState(false);
 
@@ -41,6 +43,9 @@ export default function NotebookShell() {
     setMessages(loadMessages(doc.documentId));
     setSources([]);
     setSourcesOpen(false);
+    setThinking(false);
+    setThinkingStep("");
+    setStreamingContent("");
   }
 
   function removeDoc(documentId: string) {
@@ -88,8 +93,12 @@ export default function NotebookShell() {
     ];
     setMessages(next);
     setThinking(true);
+    setThinkingStep("");
+    setStreamingContent("");
     setSources([]);
     setSourcesOpen(false);
+
+    let accumulated = "";
 
     try {
       const res = await fetch("/api/chat", {
@@ -100,19 +109,64 @@ export default function NotebookShell() {
           message: userMessage,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "Chat failed");
 
-      const withReply: Message[] = [
-        ...next,
-        { role: "assistant", content: data.answer },
-      ];
-      setMessages(withReply);
-      saveMessages(activeDoc.documentId, withReply);
+      if (!res.ok || !res.body) {
+        const data = await res.json().catch(() => ({ error: "Chat failed" }));
+        throw new Error((data as { error?: string }).error ?? "Chat failed");
+      }
 
-      if ((data.sources as Source[])?.length > 0) {
-        setSources(data.sources as Source[]);
-        setSourcesOpen(true);
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += dec.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const event = JSON.parse(line.slice(6)) as {
+              type: string;
+              content?: string;
+              step?: string;
+              sources?: Source[];
+              error?: string;
+            };
+
+            if (event.type === "status") {
+              setThinkingStep(event.step ?? "");
+            } else if (event.type === "token") {
+              accumulated += event.content ?? "";
+              setStreamingContent(accumulated);
+              // Once we start receiving tokens, clear the "thinking" indicator
+              if (thinking) setThinking(false);
+            } else if (event.type === "sources") {
+              if (event.sources && event.sources.length > 0) {
+                setSources(event.sources);
+                setSourcesOpen(true);
+              }
+            } else if (event.type === "done") {
+              // Finalise the message
+              const withReply: Message[] = [
+                ...next,
+                { role: "assistant", content: accumulated },
+              ];
+              setMessages(withReply);
+              saveMessages(activeDoc.documentId, withReply);
+              setStreamingContent("");
+              setThinking(false);
+            } else if (event.type === "error") {
+              throw new Error(event.error ?? "Stream error");
+            }
+          } catch {
+            // malformed SSE line — skip
+          }
+        }
       }
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -124,6 +178,8 @@ export default function NotebookShell() {
       saveMessages(activeDoc.documentId, withError);
     } finally {
       setThinking(false);
+      setThinkingStep("");
+      setStreamingContent("");
     }
   }
 
@@ -201,6 +257,8 @@ export default function NotebookShell() {
                 <ChatThread
                   messages={messages}
                   thinking={thinking}
+                  thinkingStep={thinkingStep}
+                  streamingContent={streamingContent}
                   filename={activeDoc.filename}
                   onChipClick={(text) => {
                     setInput(text);
