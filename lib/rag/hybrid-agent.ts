@@ -234,8 +234,14 @@ function makeNodes(documentId: string, capturedDocs: Document[]) {
 
     const sysPrompt = hasDocs
       ? "You are a helpful assistant. Answer the user's question using ONLY the provided document context. " +
-        "Be thorough, accurate, and cite the relevant sections by their number [1], [2], etc."
-      : "You are a helpful assistant. Answer the user's question directly.";
+        "Be thorough, accurate, and cite the relevant sections by their number [1], [2], etc. " +
+        "CRITICAL: If the answer to the question is not found in the provided document context, you MUST respond with: " +
+        '"I cannot find the answer to this question in the provided documents." ' +
+        "Do NOT use your general knowledge or training data to answer questions. " +
+        "Only answer based on what is explicitly stated in the document context."
+      : "You are a helpful assistant. The user asked a question but no relevant document context was retrieved. " +
+        'You MUST respond with: "I cannot find the answer to this question in the provided documents." ' +
+        "Do NOT answer from your general knowledge.";
 
     const response = await llm.invoke(
       [
